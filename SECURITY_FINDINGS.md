@@ -1,6 +1,6 @@
 # Application Security Review — Lean 3 (thMthMnky/lean)
 
-Scope: language server / JSON-RPC, leanpkg, `.olean` deserialization, path handling, CI/CD secrets, credentials, SSRF/redirects/header injection.
+Scope: language server / JSON-RPC, leanpkg, `.olean` deserialization, path handling, CI/CD secrets, credentials, SSRF/redirects/header injection, **process execution / IO / `#eval` / native compilation / command injection / trust-level sandboxing**.
 
 Only **MEDIUM / HIGH / CRITICAL** findings with complete attacker→impact chains are listed. Isolated unsafe patterns without a realistic chain are omitted.
 
@@ -430,6 +430,206 @@ Local filesystem oracle / loader gadget that upgrades olean plant into reliable 
 
 ---
 
+## HIGH-7 — Windows `CreateProcess` argument injection breaks argv isolation (leanpkg configure-time RCE)
+
+### Evidence
+
+Windows spawn builds one command string by wrapping each argument in quotes **without escaping embedded `"`**:
+
+```137:154:src/library/process.cpp
+    std::string command;
+
+    // This needs some thought, on Windows we must pass a command string
+    // which is a valid command, that is a fully assembled command to be executed.
+    //
+    // We must escape the arguments to preseving spacing and other characters,
+    // we might need to revisit escaping here.
+    bool once_through = false;
+    for (auto arg : m_args) {
+        if (once_through) {
+            command += " \"";
+        }
+        command += arg;
+        if (once_through) {
+            command += "\"";
+        }
+        once_through = true;
+    }
+```
+
+`CreateProcess` is called with `lpApplicationName = NULL`, so Windows re-parses that string:
+
+```221:231:src/library/process.cpp
+    bSuccess = CreateProcess(
+        NULL,
+        const_cast<char *>(command.c_str()), // command line
+        NULL,                                // process security attributes
+        NULL,                                // primary thread security attributes
+        TRUE,                                // handles are inherited
+        0,                                   // creation flags
+        NULL,                                // use parent's environment
+        cwd ? cwd->c_str() : NULL,           // current directory
+        &siStartInfo,                        // STARTUPINFO pointer
+        &piProcInfo);                        // receives PROCESS_INFORMATION
+```
+
+VM IO exposes this to Lean as separate argv (`io_process_spawn` → `process::arg`):
+
+```340:370:src/library/vm/vm_io.cpp
+static vm_obj io_process_spawn(vm_obj const & process_obj, vm_obj const &) {
+    std::string cmd = to_string(cfield(process_obj, 0));
+    // ...
+    lean::process proc(cmd, stdin_stdio, stdout_stdio, stderr_stdio);
+    for (auto arg : args) {
+        proc.arg(arg);
+    }
+    // ...
+    return mk_io_result(to_obj(proc.spawn()));
+}
+```
+
+Unix path uses `execvp` with a real argv array (no shell, no re-parse) — **Windows-only** break of the argv contract.
+
+leanpkg feeds dependency URLs straight into that spawn:
+
+```73:75:leanpkg/leanpkg/resolve.lean
+    exec_cmd {cmd := "mkdir", args := ["-p", depdir]},
+    exec_cmd {cmd := "git", args := ["clone", url, depdir]}
+```
+
+### Attack chain
+
+1. **Attacker**: author of a Lean package (or transitive `leanpkg.toml`) publishes a dependency whose `git` URL embeds a quote, e.g.  
+   `git = "--upload-pack=evil.exe\" \".\"`  
+   (TOML string; `dep.name` can be anything benign like `pwn`).
+2. **Victim** (Windows) runs `leanpkg configure` / `build` / `install` on a project that pulls that dependency. Typical projects are themselves git checkouts.
+3. leanpkg calls `io.proc.spawn` with argv conceptually `["git","clone", url, "_target/deps/pwn"]`.
+4. `process.cpp` builds:  
+   `git "clone" "--upload-pack=evil.exe" "." "_target/deps/pwn"`.
+5. Windows `CreateProcess` reparses quotes → git actually receives  
+   `clone`, `--upload-pack=evil.exe`, `.`, `_target/deps/pwn`.
+6. `git clone --upload-pack=evil.exe . <dest>` runs **`evil.exe` locally** as the upload-pack helper while cloning the victim’s own repo (`.` is a valid local git repository). Confirmed with an equivalent argv on Linux: writing a marker file via a fake upload-pack binary.
+
+Any other Lean/Windows code that passes attacker-influenced strings as `io.proc.spawn` / `io.cmd` args (filenames, URLs, revs) has the same break-out.
+
+### Mitigations
+
+- None for Windows quoting (comment even admits escaping is incomplete).
+- leanpkg does **not** insert `--` before the URL/rev operands (see HIGH-8).
+- Trust level / server mode do not gate process spawn.
+
+### Impact
+
+**RCE at `leanpkg configure` time on Windows** — before the victim necessarily elaborates any `.lean` from the package. Also general argument injection for all Windows users of `io.cmd` / `io.proc.spawn`.
+
+### Expected by design?
+
+**No.** The Lean IO API documents discrete argv (`spawn_args.args : list string`). Re-parsing without `\"` / `\\` escaping is a platform bug, not an intentional shell.
+
+---
+
+## HIGH-8 — leanpkg: unsanitized git URL/rev operands (missing `--`) enable option injection
+
+### Evidence
+
+```75:78:leanpkg/leanpkg/resolve.lean
+    exec_cmd {cmd := "git", args := ["clone", url, depdir]}
+  },
+  hash ← git_parse_origin_revision depdir rev,
+  exec_cmd {cmd := "git", args := ["checkout", "--detach", hash], cwd := depdir},
+```
+
+```20:21:leanpkg/leanpkg/git.lean
+def git_parse_revision (git_repo_dir : string) (rev : string) : io string := do
+rev ← io.cmd {cmd := "git", args := ["rev-parse", "-q", "--verify", rev], cwd := git_repo_dir},
+```
+
+URLs/revs come from `leanpkg.toml` with no allowlist and no `--` separator before operands. Combined with HIGH-3 (`dep.name` path traversal) and HIGH-7 (Windows quote split), dashed strings become extra git options.
+
+### Attack chain
+
+1. Attacker controls `git` / `rev` fields in a dependency manifest (direct or transitive).
+2. On Windows, HIGH-7 turns one URL into multiple argv tokens (e.g. inject `--upload-pack=…` and `.`).
+3. Even without quote-breaking, a URL that is itself a single dashed option (`--upload-pack=…`) is passed where git expects a repository operand — latent option injection whenever surrounding argv/control flow supplies a valid local repo (HIGH-3 path traversal to an existing `.git`, or future API changes).
+4. Impacting commands: `git clone`, `git rev-parse --verify <rev>`, `git checkout --detach <hash>`.
+
+### Mitigations
+
+- Discrete argv (no `/bin/sh`) — blocks shell metacharacters but **not** git option injection.
+- No validation that URLs look like `https://`, `git@`, or `file://`.
+
+### Impact
+
+Enables configure-time command execution when combined with HIGH-7 (proven) or HIGH-3; standalone dashed-URL abuse is a realistic footgun for any git-based package manager.
+
+### Expected by design?
+
+**No.** Passing `git clone -- "$url" "$depdir"` / validating URL schemes is standard hardening.
+
+---
+
+## MEDIUM-3 — Windows process env mutation is process-global and thread-unsafe
+
+### Evidence
+
+```208:235:src/library/process.cpp
+    // TODO(gabriel): this is thread-unsafe
+    std::unordered_map<std::string, optional<std::string>> old_env_vars;
+    for (auto & entry : env) {
+        // ...
+        set_env(entry.first, entry.second);  // SetEnvironmentVariable on *parent*
+    }
+
+    bSuccess = CreateProcess(
+        ...
+        NULL,                                // use parent's environment
+        ...
+    );
+
+    for (auto & entry : old_env_vars) {
+        set_env(entry.first, entry.second);
+    }
+```
+
+`lean --server` runs a multithreaded task queue (`src/shell/server.cpp`) and will elaborate/`#eval` open files concurrently. Child env is requested via `spawn_args.env` (`vm_io.cpp`).
+
+### Attack chain
+
+1. Attacker’s `.lean` (opened in the IDE / synced to the language server) runs `#eval` / tactic `unsafe_run_io` that `io.proc.spawn`s with `env := [("PATH", some attacker_dir), ...]`.
+2. During the window between `SetEnvironmentVariable` and restore, **other server threads** inherit the attacker PATH (or other vars) for their own `CreateProcess` calls / CRT `getenv`.
+3. A concurrent spawn of `git` / `lean` / tools can resolve attacker binaries → RCE, or leak secrets via redirected helper tools.
+
+Note: the same file can already call `io.proc.spawn` directly (by design). This finding matters when an environment tries to allow “limited” IO (e.g. only spawning allowlisted tools) or when one buffer’s eval should not poison another buffer’s tool invocations.
+
+### Mitigations
+
+- Comment acknowledges unsafety; Unix path uses per-child `setenv` after `fork` (still not `execve` envp, but at least post-fork).
+- No critical section around the mutate/`CreateProcess`/restore sequence.
+
+### Impact
+
+Cross-thread environment integrity failure in server mode; elevates “spawn with custom env” into a parent-process env injection primitive on Windows.
+
+### Expected by design?
+
+**No** (explicit TODO; CreateProcess supports `lpEnvironment`).
+
+---
+
+## Process / IO / eval / trust — by design (not filed as vulns)
+
+| Topic | Evidence | Why not a vuln |
+|-------|----------|----------------|
+| `#eval` / `try_exec_io` runs full IO including `process.spawn` | `builtin_cmds.cpp` `eval_cmd` → `eval_helper::try_exec`; `vm_io.cpp` | Local theorem prover intentionally executes user meta/IO. |
+| `trust=0` still allows `#eval` / IO / leanpkg RCE | Trust only gates macros / olean checking (`environment.h`, `type_checker.cpp`); no checks in `vm_io.cpp` / `eval_cmd` | Trust level is a **proof-soundness** dial, not a sandbox. Docs: “0 means do not trust any macro”. |
+| `tactic.unsafe_run_io` | `tactic_state.cpp:829`, `library/system/io.lean` | Documented “back door” for tactics (SMT solvers, etc.). |
+| IDE server elaborates `#eval` in synced buffers | `server.cpp` `handle_sync` → `module_mgr` parse | stdin/stdout subprocess; opening untrusted Lean is equivalent to running it. |
+| `debug.cpp` `system("gdb …")` | ~line 122 | Interactive assert dialog only; PID not attacker-controlled; server disables dialog. |
+| Native compiler `cpp_compiler::run` | Header-only in-tree (`native_compiler/cpp_compiler.h`); no `.cpp` impl | Incomplete feature, not a reachable injection sink in this tree. |
+| Unix `execvp` PATH search | `process.cpp:338` | Normal argv spawn; not shell injection. |
+
+---
+
 ## Out of scope / no MEDIUM+ chain found
 
 | Area | Result |
@@ -437,12 +637,14 @@ Local filesystem oracle / loader gadget that upgrades olean plant into reliable 
 | Language server network bind/listen/HTTP | Server is **stdin/stdout JSON** only (`server::run`); no socket server. `--server=file` is local debug redirect. No remote JSON-RPC/SSRF/open-redirect/header-injection chain without an already-local attacker. |
 | Hardcoded Dropbox tokens | `script/dropbox_upload.py` takes `--dropbox-token` from argv (not hardcoded). |
 | Classic HTTP open redirect / header injection | No HTTP client/server application surface in `src/shell` beyond CI scripts. |
+| Shell injection via `/bin/sh -c` in process spawn | Unix uses `execvp`; Windows uses `CreateProcess` (no `cmd.exe`). Residual issue is **argument** injection (HIGH-7), not shell metacharacters. |
 
 ---
 
 ## Priority remediation (informational)
 
 1. Default to `trust_lvl = 0` or refuse `.olean` unless explicitly `--trust-oleans`; always `check_hash = true`.
-2. Sanitize leanpkg dependency names; pass `git clone -- "$url" "$depdir"`; reject `..` and absolute names.
-3. Stop embedding `GH_TOKEN` in git URLs; use credential helpers / GitHub App tokens; pin Codecov uploader by hash or drop it.
-4. Treat leanpkg builds of untrusted git deps as equivalent to running untrusted code (document + optional sandbox).
+2. Sanitize leanpkg dependency names; pass `git clone -- "$url" "$depdir"`; reject `..` and absolute names; allowlist URL schemes.
+3. **Windows:** implement correct `CreateProcess` quoting (escape `\` / `"`), or pass `lpApplicationName` + properly encoded command line; build child environment block instead of mutating the parent.
+4. Stop embedding `GH_TOKEN` in git URLs; use credential helpers / GitHub App tokens; pin Codecov uploader by hash or drop it.
+5. Treat leanpkg builds of untrusted git deps as equivalent to running untrusted code (document + optional sandbox).
